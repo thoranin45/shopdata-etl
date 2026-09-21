@@ -1,0 +1,8 @@
+# Python environment & cache
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Pipeline outputs (generated, not source code)
+analytics.db
+clean_*.csv
