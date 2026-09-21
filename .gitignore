@@ -6,3 +6,4 @@ __pycache__/
 # Pipeline outputs (generated, not source code)
 analytics.db
 clean_*.csv
+profile_output.txt
