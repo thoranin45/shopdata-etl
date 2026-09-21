@@ -62,3 +62,96 @@ def clean_customers(raw_customers: pd.DataFrame) -> pd.DataFrame:
         phone=standardize_phone(customers["phone"]),
         email=fill_missing_emails(customers["email"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------
+
+# Values for the fx_rate_source column: how usd_amount was obtained
+FX_NATIVE_USD = "native_usd"    # order was already in USD
+FX_EXACT = "exact"              # converted with the rate for that currency and order_date
+FX_ASSUMED_USD = "assumed_usd"  # currency or rate missing, amount assumed to be USD (per spec)
+
+
+def filter_invalid_amounts(orders: pd.DataFrame) -> pd.DataFrame:
+    """Drop orders whose total_amount is zero, negative or missing.
+
+    Zero and negative amounts are system errors (per spec). Missing amounts are
+    dropped too, because an order without an amount has no value to report.
+    """
+    return orders.loc[orders["total_amount"] > 0].reset_index(drop=True)
+
+
+def normalize_currency(currencies: pd.Series) -> pd.Series:
+    """Trim and upper-case currency codes; blank values become <NA>."""
+    cleaned = currencies.astype("string").str.strip().str.upper()
+    return cleaned.replace("", pd.NA)
+
+
+def prepare_exchange_rates(rates: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the exchange-rate table and drop rows that cannot be joined safely.
+
+    Rows with a missing currency, missing date or non-positive rate are removed.
+    This matters because pandas merge treats missing keys as equal, so a rate
+    with a missing date would otherwise match every order with a missing date.
+    """
+    prepared = rates.assign(
+        currency=normalize_currency(rates["currency"]),
+        rate_date=pd.to_datetime(rates["date"], errors="coerce", format="ISO8601"),
+    )
+    is_valid = (
+        prepared["currency"].notna()
+        & prepared["rate_date"].notna()
+        & (prepared["rate_to_usd"] > 0)
+    )
+    return prepared.loc[is_valid, ["currency", "rate_date", "rate_to_usd"]]
+
+
+def convert_to_usd(orders: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
+    """Add usd_amount, exchange_rate and fx_rate_source columns.
+
+    usd_amount = total_amount * rate_to_usd for the order's currency on its order_date.
+    If the currency is missing or has no rate for that date, the amount is assumed
+    to already be USD (per spec) and flagged as 'assumed_usd'.
+
+    Raises pandas.errors.MergeError if the rates contain more than one rate for the
+    same currency and date, since that would silently duplicate orders.
+    """
+    orders_keyed = orders.assign(
+        currency=normalize_currency(orders["currency"]),
+        _fx_date=pd.to_datetime(orders["order_date"], errors="coerce", format="ISO8601"),
+    )
+    rates_keyed = prepare_exchange_rates(rates).rename(columns={"rate_date": "_fx_date"})
+
+    merged = orders_keyed.merge(
+        rates_keyed,
+        how="left",
+        on=["currency", "_fx_date"],
+        validate="many_to_one",
+    )
+
+    is_usd = merged["currency"].eq("USD").fillna(False).astype(bool)
+    has_rate = merged["rate_to_usd"].notna() & ~is_usd
+
+    applied_rate = merged["rate_to_usd"].where(has_rate, 1.0)
+    fx_rate_source = (
+        pd.Series(FX_ASSUMED_USD, index=merged.index)
+        .mask(has_rate, FX_EXACT)
+        .mask(is_usd, FX_NATIVE_USD)
+    )
+
+    return merged.assign(
+        exchange_rate=applied_rate,
+        usd_amount=(merged["total_amount"] * applied_rate).round(2),
+        fx_rate_source=fx_rate_source,
+    ).drop(columns=["_fx_date", "rate_to_usd"])
+
+
+def clean_orders(raw_orders: pd.DataFrame, raw_rates: pd.DataFrame) -> pd.DataFrame:
+    """Apply all order cleaning rules: drop invalid amounts, then convert to USD.
+
+    Orphan orders and the status column are intentionally kept; see README.
+    """
+    valid_orders = filter_invalid_amounts(raw_orders)
+    return convert_to_usd(valid_orders, raw_rates)
